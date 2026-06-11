@@ -1,14 +1,34 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+mod commands;
+mod error;
+mod vault;
+
+use std::sync::Mutex;
+
+use tauri::Manager;
+
+use commands::keys::VaultState;
+use vault::core::Vault;
+use vault::secrets::KeyringStore;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .setup(|app| {
+            // 環境変数 KEYNEST_DB で DB パスを上書き可能(開発・テスト用)
+            let db_path = match std::env::var("KEYNEST_DB") {
+                Ok(custom) => std::path::PathBuf::from(custom),
+                Err(_) => app.path().app_data_dir()?.join("keynest.db"),
+            };
+            let vault = Vault::open(&db_path, Box::new(KeyringStore))?;
+            app.manage(VaultState(Mutex::new(vault)));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::keys::set_key,
+            commands::keys::list_keys,
+            commands::keys::delete_key,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
