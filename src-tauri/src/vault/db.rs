@@ -8,7 +8,10 @@ use crate::error::Result;
 
 /// 番号順に適用するマイグレーション。適用済みの位置は PRAGMA user_version で管理する。
 /// 既存リリースのマイグレーションは変更せず、末尾に追加すること。
-const MIGRATIONS: &[&str] = &[include_str!("../../migrations/001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../../migrations/001_init.sql"),
+    include_str!("../../migrations/002_key_rotations.sql"),
+];
 
 /// DB を開き、外部キー制約とスキーマを保証したコネクションを返す。
 pub fn open(path: &Path) -> Result<Connection> {

@@ -12,3 +12,4 @@ pub mod envfile;
 pub mod presets;
 pub mod scan;
 pub mod secrets;
+pub mod validate;

@@ -10,6 +10,7 @@ export interface KeyInfo {
   last_validated_at: string | null;
   note: string | null;
   used_by: string[];
+  validatable: boolean;
 }
 
 export interface SetKeyResult {
@@ -54,6 +55,25 @@ export interface InjectResult {
   project: string;
   env_path: string;
   written: string[];
+}
+
+export interface ValidateResult {
+  key: string;
+  ok: boolean;
+  detail: string;
+  last_validated_at: string | null;
+}
+
+export interface RotateResult {
+  key: string;
+  env_var_name: string;
+  value_masked: string;
+  old_value_masked: string | null;
+}
+
+export interface RotationInfo {
+  rotated_at: string;
+  old_value_masked: string;
 }
 
 export type ScanStatus = "new" | "exists" | "conflict" | "skipped";

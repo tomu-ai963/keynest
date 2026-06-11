@@ -5,10 +5,13 @@ import type {
   KeyInfo,
   Preset,
   ProjectInfo,
+  RotateResult,
+  RotationInfo,
   ScanApplyReport,
   ScanReport,
   ScanSelection,
   SetKeyResult,
+  ValidateResult,
 } from "./types";
 
 export function listKeys(service?: string): Promise<KeyInfo[]> {
@@ -37,6 +40,22 @@ export function setKey(input: SetKeyInput): Promise<SetKeyResult> {
 
 export function deleteKey(service: string, name?: string): Promise<string> {
   return invoke("delete_key", { service, name: name ?? null });
+}
+
+export function validateKey(service: string, name?: string): Promise<ValidateResult> {
+  return invoke("validate_key", { service, name: name ?? null });
+}
+
+export function rotateKey(
+  service: string,
+  name: string | undefined,
+  newValue: string,
+): Promise<RotateResult> {
+  return invoke("rotate_key", { service, name: name ?? null, newValue });
+}
+
+export function listRotations(service: string, name?: string): Promise<RotationInfo[]> {
+  return invoke("list_rotations", { service, name: name ?? null });
 }
 
 export function listPresets(): Promise<Preset[]> {

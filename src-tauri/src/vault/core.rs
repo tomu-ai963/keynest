@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::secrets::SecretStore;
-use super::{db, envfile};
+use super::{db, envfile, validate};
 use crate::error::{Error, Result};
 
 pub struct Vault {
@@ -36,6 +36,8 @@ pub struct KeyInfo {
     pub last_validated_at: Option<String>,
     pub note: Option<String>,
     pub used_by: Vec<String>,
+    /// このサービスの検証(validate_key)に対応しているか
+    pub validatable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +68,28 @@ pub struct InjectResult {
     pub project: String,
     pub env_path: String,
     pub written: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidateResult {
+    pub key: String,
+    pub ok: bool,
+    pub detail: String,
+    pub last_validated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateResult {
+    pub key: String,
+    pub env_var_name: String,
+    pub value_masked: String,
+    pub old_value_masked: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotationInfo {
+    pub rotated_at: String,
+    pub old_value_masked: String,
 }
 
 struct FoundKey {
@@ -237,9 +261,11 @@ impl Vault {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let map_row = |row: &rusqlite::Row| -> rusqlite::Result<KeyInfo> {
+            let service: String = row.get(1)?;
             Ok(KeyInfo {
                 key_id: row.get(0)?,
-                service: row.get(1)?,
+                validatable: validate::is_supported(&service),
+                service,
                 name: row.get(2)?,
                 env_var_name: row.get(3)?,
                 created_at: row.get(4)?,
@@ -278,6 +304,90 @@ impl Vault {
         self.conn
             .execute("DELETE FROM keys WHERE id = ?1", [key.id])?;
         Ok(key.label())
+    }
+
+    /// プロバイダ API を叩いてキーの生死を確認する。成功時は last_validated_at を更新する。
+    /// 生の値はセキュアストレージから読んでプロバイダにのみ送る(返り値には含めない)。
+    pub fn validate_key(&mut self, service: &str, name: Option<&str>) -> Result<ValidateResult> {
+        let key = self.find_key(service, name)?;
+        let Some(value) = self.store.get(key.id)? else {
+            return Err(Error::NotFound(format!(
+                "セキュアストレージに値がありません: {}",
+                key.label()
+            )));
+        };
+        let result = validate::validate(&key.service, &value)?;
+        if result.ok {
+            self.conn.execute(
+                "UPDATE keys SET last_validated_at = datetime('now') WHERE id = ?1",
+                [key.id],
+            )?;
+        }
+        let last_validated_at: Option<String> = self.conn.query_row(
+            "SELECT last_validated_at FROM keys WHERE id = ?1",
+            [key.id],
+            |row| row.get(0),
+        )?;
+        Ok(ValidateResult {
+            key: key.label(),
+            ok: result.ok,
+            detail: result.detail,
+            last_validated_at,
+        })
+    }
+
+    /// キーの値を新しい値に差し替え、旧値のマスクを key_rotations に記録する。
+    pub fn rotate_key(
+        &mut self,
+        service: &str,
+        name: Option<&str>,
+        new_value: &str,
+    ) -> Result<RotateResult> {
+        if new_value.is_empty() {
+            return Err(Error::InvalidInput("new_value が空です".into()));
+        }
+        let key = self.find_key(service, name)?;
+        let Self { conn, store } = self;
+        let old_value = store.get(key.id)?;
+        if old_value.as_deref() == Some(new_value) {
+            return Err(Error::InvalidInput("新しい値が現在の値と同じです".into()));
+        }
+        let old_masked = old_value.as_deref().map(mask);
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO key_rotations (key_id, old_value_masked) VALUES (?1, ?2)",
+            params![key.id, old_masked.clone().unwrap_or_default()],
+        )?;
+        tx.execute(
+            "UPDATE keys SET last_validated_at = NULL WHERE id = ?1",
+            [key.id],
+        )?;
+        store.set(key.id, new_value)?;
+        tx.commit()?;
+        Ok(RotateResult {
+            key: key.label(),
+            env_var_name: key.env_var_name,
+            value_masked: mask(new_value),
+            old_value_masked: old_masked,
+        })
+    }
+
+    /// キーのローテーション履歴(新しい順)を返す。
+    pub fn list_rotations(&self, service: &str, name: Option<&str>) -> Result<Vec<RotationInfo>> {
+        let key = self.find_key(service, name)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT rotated_at, old_value_masked FROM key_rotations
+             WHERE key_id = ?1 ORDER BY rotated_at DESC, id DESC",
+        )?;
+        let rotations = stmt
+            .query_map([key.id], |row| {
+                Ok(RotationInfo {
+                    rotated_at: row.get(0)?,
+                    old_value_masked: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rotations)
     }
 
     fn get_or_create_project(&self, name: &str, path: Option<&str>) -> Result<i64> {
@@ -750,6 +860,112 @@ mod tests {
             vault.inject("unknown-project", None).unwrap_err(),
             Error::NotFound(_)
         ));
+    }
+
+    #[test]
+    fn rotate_key_records_masked_history_and_updates_secret() {
+        let (mut vault, store, _dir) = test_vault();
+        let result = vault
+            .set_key(
+                "stripe",
+                "default",
+                "sk_live_original-value",
+                "STRIPE_SECRET_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        // 検証済みの状態を作る(ネットワークには触れない)
+        vault
+            .conn
+            .execute(
+                "UPDATE keys SET last_validated_at = datetime('now') WHERE id = ?1",
+                [result.key_id],
+            )
+            .unwrap();
+
+        let rotated = vault
+            .rotate_key("stripe", None, "sk_live_rotated-value!")
+            .unwrap();
+        assert_eq!(rotated.key, "stripe/default");
+        assert!(!rotated.value_masked.contains("rotated-value"));
+        assert_eq!(rotated.old_value_masked.as_deref(), Some("sk_l…alue"));
+        assert_eq!(
+            store.get(result.key_id).unwrap().as_deref(),
+            Some("sk_live_rotated-value!")
+        );
+
+        // 履歴に旧値のマスクだけが残り、ローテーション後は未検証に戻る
+        let history = vault.list_rotations("stripe", None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].old_value_masked, "sk_l…alue");
+        let keys = vault.list_keys(Some("stripe")).unwrap();
+        assert_eq!(keys[0].last_validated_at, None);
+
+        vault
+            .rotate_key("stripe", None, "sk_live_third-value!!")
+            .unwrap();
+        assert_eq!(vault.list_rotations("stripe", None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rotate_key_rejects_empty_or_unchanged_value() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "stripe",
+                "default",
+                "sk_live_same-value!!",
+                "STRIPE_SECRET_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            vault.rotate_key("stripe", None, "").unwrap_err(),
+            Error::InvalidInput(_)
+        ));
+        assert!(matches!(
+            vault
+                .rotate_key("stripe", None, "sk_live_same-value!!")
+                .unwrap_err(),
+            Error::InvalidInput(_)
+        ));
+        assert!(vault.list_rotations("stripe", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_key_rejects_unsupported_service() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "myapp",
+                "default",
+                "value-1234567890",
+                "MYAPP_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            vault.validate_key("myapp", None).unwrap_err(),
+            Error::InvalidInput(_)
+        ));
+        // validatable フラグはバリデータ対応表と一致する
+        let keys = vault.list_keys(None).unwrap();
+        assert!(!keys[0].validatable);
+        vault
+            .set_key(
+                "anthropic",
+                "default",
+                "sk-ant-aaaaaaaa",
+                "ANTHROPIC_API_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        let keys = vault.list_keys(Some("anthropic")).unwrap();
+        assert!(keys[0].validatable);
     }
 
     #[test]

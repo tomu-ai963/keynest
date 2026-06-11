@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use tauri::State;
 
 use crate::error::Error;
-use crate::vault::core::{KeyInfo, SetKeyResult, Vault};
+use crate::vault::core::{
+    KeyInfo, RotateResult, RotationInfo, SetKeyResult, ValidateResult, Vault,
+};
 
 pub struct VaultState(pub Mutex<Vault>);
 
@@ -46,4 +48,44 @@ pub fn delete_key(
         .lock()
         .unwrap()
         .delete_key(&service, name.as_deref())
+}
+
+#[tauri::command]
+pub fn validate_key(
+    state: State<'_, VaultState>,
+    service: String,
+    name: Option<String>,
+) -> Result<ValidateResult, Error> {
+    state
+        .0
+        .lock()
+        .unwrap()
+        .validate_key(&service, name.as_deref())
+}
+
+#[tauri::command]
+pub fn rotate_key(
+    state: State<'_, VaultState>,
+    service: String,
+    name: Option<String>,
+    new_value: String,
+) -> Result<RotateResult, Error> {
+    state
+        .0
+        .lock()
+        .unwrap()
+        .rotate_key(&service, name.as_deref(), &new_value)
+}
+
+#[tauri::command]
+pub fn list_rotations(
+    state: State<'_, VaultState>,
+    service: String,
+    name: Option<String>,
+) -> Result<Vec<RotationInfo>, Error> {
+    state
+        .0
+        .lock()
+        .unwrap()
+        .list_rotations(&service, name.as_deref())
 }
