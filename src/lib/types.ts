@@ -55,3 +55,45 @@ export interface InjectResult {
   env_path: string;
   written: string[];
 }
+
+export type ScanStatus = "new" | "exists" | "conflict" | "skipped";
+
+export interface ScanEntry {
+  var: string;
+  status: ScanStatus;
+  service: string | null;
+  value_masked: string | null;
+  existing_key: string | null;
+}
+
+export interface ScanFile {
+  file: string;
+  project: string;
+  entries: ScanEntry[];
+}
+
+export interface ScanReport {
+  files_scanned: number;
+  summary: Partial<Record<ScanStatus, number>>;
+  files: ScanFile[];
+}
+
+export interface ScanSelection {
+  file: string;
+  vars: string[];
+}
+
+export type ScanApplyStatus = "imported" | "linked" | "conflict" | "missing";
+
+export interface ScanApplyEntry {
+  file: string;
+  var: string;
+  status: ScanApplyStatus;
+  key: string | null;
+  project: string | null;
+}
+
+export interface ScanApplyReport {
+  summary: Partial<Record<ScanApplyStatus, number>>;
+  results: ScanApplyEntry[];
+}

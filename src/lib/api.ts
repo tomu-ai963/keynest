@@ -5,6 +5,9 @@ import type {
   KeyInfo,
   Preset,
   ProjectInfo,
+  ScanApplyReport,
+  ScanReport,
+  ScanSelection,
   SetKeyResult,
 } from "./types";
 
@@ -68,4 +71,12 @@ export function deleteProject(project: string): Promise<void> {
 
 export function inject(project: string, path?: string): Promise<InjectResult> {
   return invoke("inject", { project, path: path ?? null });
+}
+
+export function scanPreview(path: string, maxDepth?: number): Promise<ScanReport> {
+  return invoke("scan_preview", { path, maxDepth: maxDepth ?? null });
+}
+
+export function scanApply(selections: ScanSelection[]): Promise<ScanApplyReport> {
+  return invoke("scan_apply", { selections });
 }

@@ -11,8 +11,8 @@ use super::{db, envfile};
 use crate::error::{Error, Result};
 
 pub struct Vault {
-    conn: Connection,
-    store: Box<dyn SecretStore>,
+    pub(super) conn: Connection,
+    pub(super) store: Box<dyn SecretStore>,
 }
 
 #[derive(Debug, Serialize)]

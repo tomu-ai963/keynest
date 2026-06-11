@@ -3,8 +3,9 @@ import { listKeys, listProjects } from "./lib/api";
 import type { KeyInfo, ProjectInfo } from "./lib/types";
 import KeysView from "./views/KeysView";
 import ProjectsView from "./views/ProjectsView";
+import ScanView from "./views/ScanView";
 
-type Tab = "keys" | "projects";
+type Tab = "keys" | "projects" | "scan";
 
 function App() {
   const [tab, setTab] = useState<Tab>("keys");
@@ -53,6 +54,9 @@ function App() {
         <button className={tabClass("projects")} onClick={() => setTab("projects")}>
           プロジェクト({projects.length})
         </button>
+        <button className={tabClass("scan")} onClick={() => setTab("scan")}>
+          スキャン
+        </button>
       </nav>
 
       {message && (
@@ -64,11 +68,11 @@ function App() {
         <div className="mb-4 rounded-md bg-red-50 px-4 py-2 text-sm text-red-800">{error}</div>
       )}
 
-      {tab === "keys" ? (
-        <KeysView keys={keys} onChanged={refresh} notify={notify} />
-      ) : (
+      {tab === "keys" && <KeysView keys={keys} onChanged={refresh} notify={notify} />}
+      {tab === "projects" && (
         <ProjectsView projects={projects} keys={keys} onChanged={refresh} notify={notify} />
       )}
+      {tab === "scan" && <ScanView onChanged={refresh} notify={notify} />}
     </main>
   );
 }
