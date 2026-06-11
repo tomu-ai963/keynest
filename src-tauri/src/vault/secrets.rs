@@ -9,8 +9,6 @@ const NAMESPACE: &str = "keynest";
 
 pub trait SecretStore: Send {
     fn set(&self, key_id: i64, value: &str) -> Result<()>;
-    // Phase 2 の .env 書き出し(inject)まで本体コードからの呼び出しなし
-    #[allow(dead_code)]
     fn get(&self, key_id: i64) -> Result<Option<String>>;
     fn delete(&self, key_id: i64) -> Result<()>;
 }

@@ -14,6 +14,7 @@ use vault::secrets::KeyringStore;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 環境変数 KEYNEST_DB で DB パスを上書き可能(開発・テスト用)
             let db_path = match std::env::var("KEYNEST_DB") {
@@ -28,6 +29,12 @@ pub fn run() {
             commands::keys::set_key,
             commands::keys::list_keys,
             commands::keys::delete_key,
+            commands::presets::list_presets,
+            commands::projects::assign_key,
+            commands::projects::unassign_key,
+            commands::projects::list_projects,
+            commands::projects::delete_project,
+            commands::projects::inject,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

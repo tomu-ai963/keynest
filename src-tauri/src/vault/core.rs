@@ -1,12 +1,13 @@
 //! vault の高レベル API。Tauri コマンド層はこのモジュールだけを呼ぶ。
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use super::db;
 use super::secrets::SecretStore;
+use super::{db, envfile};
 use crate::error::{Error, Result};
 
 pub struct Vault {
@@ -37,10 +38,41 @@ pub struct KeyInfo {
     pub used_by: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ProjectKey {
+    pub key_id: i64,
+    pub service: String,
+    pub name: String,
+    pub env_var_name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectInfo {
+    pub project_id: i64,
+    pub name: String,
+    pub path: Option<String>,
+    pub keys: Vec<ProjectKey>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AssignResult {
+    pub key: String,
+    pub env_var_name: String,
+    pub project: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InjectResult {
+    pub project: String,
+    pub env_path: String,
+    pub written: Vec<String>,
+}
+
 struct FoundKey {
     id: i64,
     service: String,
     name: String,
+    env_var_name: String,
 }
 
 impl FoundKey {
@@ -94,7 +126,7 @@ impl Vault {
     fn find_key(&self, service: &str, name: Option<&str>) -> Result<FoundKey> {
         let service_norm = normalize_service(service);
         let mut stmt = self.conn.prepare(
-            "SELECT k.id, s.name, k.name
+            "SELECT k.id, s.name, k.name, k.env_var_name
              FROM keys k JOIN services s ON s.id = k.service_id
              WHERE s.name = ?1",
         )?;
@@ -104,6 +136,7 @@ impl Vault {
                     id: row.get(0)?,
                     service: row.get(1)?,
                     name: row.get(2)?,
+                    env_var_name: row.get(3)?,
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -246,6 +279,211 @@ impl Vault {
             .execute("DELETE FROM keys WHERE id = ?1", [key.id])?;
         Ok(key.label())
     }
+
+    fn get_or_create_project(&self, name: &str, path: Option<&str>) -> Result<i64> {
+        let existing: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id, path FROM projects WHERE name = ?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((id, _)) => {
+                if path.is_some() {
+                    self.conn.execute(
+                        "UPDATE projects SET path = ?1 WHERE id = ?2",
+                        params![path, id],
+                    )?;
+                }
+                Ok(id)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO projects (name, path) VALUES (?1, ?2)",
+                    params![name, path],
+                )?;
+                Ok(self.conn.last_insert_rowid())
+            }
+        }
+    }
+
+    /// キーをプロジェクトに紐づける。プロジェクトが未登録なら作成する。
+    pub fn assign_key(
+        &mut self,
+        service: &str,
+        name: Option<&str>,
+        project: &str,
+        project_path: Option<&str>,
+    ) -> Result<AssignResult> {
+        if project.trim().is_empty() {
+            return Err(Error::InvalidInput("project が空です".into()));
+        }
+        let key = self.find_key(service, name)?;
+        let project_id = self.get_or_create_project(project, project_path)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO key_usages (key_id, project_id) VALUES (?1, ?2)",
+            params![key.id, project_id],
+        )?;
+        Ok(AssignResult {
+            key: key.label(),
+            env_var_name: key.env_var_name,
+            project: project.to_string(),
+        })
+    }
+
+    /// キーとプロジェクトの紐づけを解除する。
+    pub fn unassign_key(
+        &mut self,
+        service: &str,
+        name: Option<&str>,
+        project: &str,
+    ) -> Result<String> {
+        let key = self.find_key(service, name)?;
+        let changed = self.conn.execute(
+            "DELETE FROM key_usages WHERE key_id = ?1
+             AND project_id = (SELECT id FROM projects WHERE name = ?2)",
+            params![key.id, project],
+        )?;
+        if changed == 0 {
+            return Err(Error::InvalidInput(format!(
+                "{} は {} に紐づいていません",
+                key.label(),
+                project
+            )));
+        }
+        Ok(key.label())
+    }
+
+    /// プロジェクト一覧(紐づくキーのメタデータ付き)を返す。
+    pub fn list_projects(&self) -> Result<Vec<ProjectInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, path FROM projects ORDER BY name")?;
+        let mut projects: Vec<ProjectInfo> = stmt
+            .query_map([], |row| {
+                Ok(ProjectInfo {
+                    project_id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    keys: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut key_stmt = self.conn.prepare(
+            "SELECT k.id, s.name, k.name, k.env_var_name
+             FROM key_usages ku
+             JOIN keys k ON k.id = ku.key_id
+             JOIN services s ON s.id = k.service_id
+             WHERE ku.project_id = ?1
+             ORDER BY s.name, k.name",
+        )?;
+        for project in &mut projects {
+            project.keys = key_stmt
+                .query_map([project.project_id], |row| {
+                    Ok(ProjectKey {
+                        key_id: row.get(0)?,
+                        service: row.get(1)?,
+                        name: row.get(2)?,
+                        env_var_name: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+        }
+        Ok(projects)
+    }
+
+    /// プロジェクトを削除する(キー本体は残る。紐づけのみ CASCADE で消える)。
+    pub fn delete_project(&mut self, project: &str) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM projects WHERE name = ?1", [project])?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("プロジェクト: {project}")));
+        }
+        Ok(())
+    }
+
+    /// プロジェクトに紐づくキー一式を、プロジェクトパス直下の .env に書き出す。
+    /// 返り値に生の値は含めない(書き出した変数名のみ)。
+    pub fn inject(&mut self, project: &str, path: Option<&str>) -> Result<InjectResult> {
+        let row: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id, path FROM projects WHERE name = ?1",
+                [project],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((project_id, stored_path)) = row else {
+            return Err(Error::NotFound(format!("プロジェクト: {project}")));
+        };
+        if let Some(p) = path {
+            self.conn.execute(
+                "UPDATE projects SET path = ?1 WHERE id = ?2",
+                params![p, project_id],
+            )?;
+        }
+        let Some(target) = path.map(String::from).or(stored_path) else {
+            return Err(Error::InvalidInput(format!(
+                "プロジェクト {project} のパスが未設定です。path を指定してください"
+            )));
+        };
+        let target_dir = Path::new(&target);
+        if !target_dir.is_dir() {
+            return Err(Error::InvalidInput(format!(
+                "ディレクトリが存在しません: {target}"
+            )));
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT k.id, k.env_var_name, s.name, k.name
+             FROM key_usages ku
+             JOIN keys k ON k.id = ku.key_id
+             JOIN services s ON s.id = k.service_id
+             WHERE ku.project_id = ?1
+             ORDER BY s.name, k.name",
+        )?;
+        let keys: Vec<(i64, String, String, String)> = stmt
+            .query_map([project_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if keys.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "プロジェクト {project} に紐づくキーがありません"
+            )));
+        }
+
+        let mut updates: HashMap<String, String> = HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for (key_id, env_var_name, service, name) in keys {
+            match self.store.get(key_id)? {
+                Some(value) => {
+                    updates.insert(env_var_name, value);
+                }
+                None => missing.push(format!("{service}/{name}")),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "セキュアストレージに値が見つからないキーがあります: {}",
+                missing.join(", ")
+            )));
+        }
+
+        let env_path = target_dir.join(".env");
+        envfile::merge(&env_path, &updates)?;
+        let mut written: Vec<String> = updates.into_keys().collect();
+        written.sort();
+        Ok(InjectResult {
+            project: project.to_string(),
+            env_path: env_path.to_string_lossy().into_owned(),
+            written,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +624,132 @@ mod tests {
         assert_eq!(deleted, "resend/default");
         assert!(vault.list_keys(None).unwrap().is_empty());
         assert_eq!(store.get(result.key_id).unwrap(), None);
+    }
+
+    #[test]
+    fn assign_and_unassign_key_to_project() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "anthropic",
+                "default",
+                "sk-ant-aaaaaaaa",
+                "ANTHROPIC_API_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        let result = vault
+            .assign_key("anthropic", None, "my-app", Some("C:\\projects\\my-app"))
+            .unwrap();
+        assert_eq!(result.key, "anthropic/default");
+        assert_eq!(result.env_var_name, "ANTHROPIC_API_KEY");
+
+        let projects = vault.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "my-app");
+        assert_eq!(projects[0].path.as_deref(), Some("C:\\projects\\my-app"));
+        assert_eq!(projects[0].keys.len(), 1);
+
+        let keys = vault.list_keys(None).unwrap();
+        assert_eq!(keys[0].used_by, vec!["my-app"]);
+
+        vault.unassign_key("anthropic", None, "my-app").unwrap();
+        assert!(vault.list_projects().unwrap()[0].keys.is_empty());
+        let err = vault.unassign_key("anthropic", None, "my-app").unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn delete_project_keeps_keys() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "stripe",
+                "default",
+                "sk_live_aaaaaaaa",
+                "STRIPE_SECRET_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        vault.assign_key("stripe", None, "shop", None).unwrap();
+        vault.delete_project("shop").unwrap();
+        assert!(vault.list_projects().unwrap().is_empty());
+        assert_eq!(vault.list_keys(None).unwrap().len(), 1);
+        assert!(matches!(
+            vault.delete_project("shop").unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn inject_writes_env_preserving_existing_content() {
+        let (mut vault, _store, _dir) = test_vault();
+        let project_dir = TempDir::new().unwrap();
+        let env_path = project_dir.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "# app config\nPORT=3000\nANTHROPIC_API_KEY=stale\n",
+        )
+        .unwrap();
+
+        vault
+            .set_key(
+                "anthropic",
+                "default",
+                "sk-ant-fresh-value",
+                "ANTHROPIC_API_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        vault
+            .set_key(
+                "resend",
+                "default",
+                "re_123456789012",
+                "RESEND_API_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        vault
+            .assign_key("anthropic", None, "my-app", project_dir.path().to_str())
+            .unwrap();
+        vault.assign_key("resend", None, "my-app", None).unwrap();
+
+        let result = vault.inject("my-app", None).unwrap();
+        assert_eq!(result.written, vec!["ANTHROPIC_API_KEY", "RESEND_API_KEY"]);
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(
+            content,
+            "# app config\nPORT=3000\nANTHROPIC_API_KEY=sk-ant-fresh-value\nRESEND_API_KEY=re_123456789012\n"
+        );
+    }
+
+    #[test]
+    fn inject_fails_without_path_or_keys() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "openai",
+                "default",
+                "sk-proj-aaaaaaaa",
+                "OPENAI_API_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        vault.assign_key("openai", None, "no-path", None).unwrap();
+        assert!(matches!(
+            vault.inject("no-path", None).unwrap_err(),
+            Error::InvalidInput(_)
+        ));
+        assert!(matches!(
+            vault.inject("unknown-project", None).unwrap_err(),
+            Error::NotFound(_)
+        ));
     }
 
     #[test]
