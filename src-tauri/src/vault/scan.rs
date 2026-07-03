@@ -327,7 +327,8 @@ fn assign_project(conn: &Connection, key_id: i64, project: &str, path: &str) -> 
 
 impl Vault {
     /// path 以下の .env をスキャンし、取り込み候補を返す(値はマスクのみ)。
-    pub fn scan_preview(&self, path: &str, max_depth: u32) -> Result<ScanReport> {
+    /// 検出した .env パスは記録し、後続の scan_apply で受理できるようにする。
+    pub fn scan_preview(&mut self, path: &str, max_depth: u32) -> Result<ScanReport> {
         let root = Path::new(path);
         if !root.is_dir() {
             return Err(Error::InvalidInput(format!(
@@ -374,8 +375,10 @@ impl Vault {
                 *summary.entry(entry.status).or_default() += 1;
                 entries.push(entry);
             }
+            let file = env_file.to_string_lossy().into_owned();
+            self.scanned_paths.insert(file.clone());
             files.push(ScanFile {
-                file: env_file.to_string_lossy().into_owned(),
+                file,
                 project,
                 entries,
             });
@@ -388,8 +391,17 @@ impl Vault {
     }
 
     /// 選択された変数を .env から読み直して取り込み、プロジェクトに紐づける。
+    /// scan_preview で検出済みのパスしか受理しない(フロントが任意パスを差し込むのを防ぐ)。
     pub fn scan_apply(&mut self, selections: &[ScanSelection]) -> Result<ScanApplyReport> {
-        let Self { conn, store } = self;
+        for sel in selections {
+            if !self.scanned_paths.contains(&sel.file) {
+                return Err(Error::InvalidInput(format!(
+                    "プレビューで検出されていないファイルは取り込めません: {}",
+                    sel.file
+                )));
+            }
+        }
+        let Self { conn, store, .. } = self;
         let tx = conn.transaction()?;
         let mut summary: HashMap<&'static str, usize> = HashMap::new();
         let mut results = Vec::new();
@@ -616,15 +628,21 @@ NOEQUAL
             .unwrap();
 
         let project = TempDir::new().unwrap();
-        let env_file = write(
+        write(
             project.path(),
             "my-app/.env",
             "ANTHROPIC_API_KEY=sk-ant-same-value\nRESEND_API_KEY=re_123456789012\n",
         );
 
+        // apply の前に preview を通す(実際のフローと同じ)。フロントは preview が
+        // 返したパス文字列をそのまま apply に渡すため、テストでも report のパスを使う。
+        let preview = vault
+            .scan_preview(project.path().to_str().unwrap(), 3)
+            .unwrap();
+        let scanned_file = preview.files[0].file.clone();
         let report = vault
             .scan_apply(&[ScanSelection {
-                file: env_file.to_string_lossy().into_owned(),
+                file: scanned_file,
                 vars: vec![
                     "ANTHROPIC_API_KEY".into(),
                     "RESEND_API_KEY".into(),
@@ -671,14 +689,17 @@ NOEQUAL
             .unwrap();
 
         let project = TempDir::new().unwrap();
-        let env_file = write(
+        write(
             project.path(),
             "my-app/.env",
             "RESEND_API_KEY=re_123456789012\n",
         );
+        let preview = vault
+            .scan_preview(project.path().to_str().unwrap(), 3)
+            .unwrap();
         let report = vault
             .scan_apply(&[ScanSelection {
-                file: env_file.to_string_lossy().into_owned(),
+                file: preview.files[0].file.clone(),
                 vars: vec!["RESEND_API_KEY".into()],
             }])
             .unwrap();
@@ -686,8 +707,29 @@ NOEQUAL
     }
 
     #[test]
+    fn apply_rejects_unscanned_file() {
+        let (mut vault, _store, _dir) = test_vault();
+        let project = TempDir::new().unwrap();
+        let env_file = write(
+            project.path(),
+            "my-app/.env",
+            "RESEND_API_KEY=re_123456789012\n",
+        );
+        // preview を通していないパスは拒否される(任意パス読み取りの防止)
+        let err = vault
+            .scan_apply(&[ScanSelection {
+                file: env_file.to_string_lossy().into_owned(),
+                vars: vec!["RESEND_API_KEY".into()],
+            }])
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+        // 取り込みは一切起きていない
+        assert!(vault.list_keys(None).unwrap().is_empty());
+    }
+
+    #[test]
     fn preview_rejects_missing_directory() {
-        let (vault, _store, _dir) = test_vault();
+        let (mut vault, _store, _dir) = test_vault();
         assert!(matches!(
             vault.scan_preview("C:\\no\\such\\dir-keynest-test", 3),
             Err(Error::InvalidInput(_))

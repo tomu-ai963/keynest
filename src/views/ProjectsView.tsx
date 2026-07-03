@@ -70,6 +70,15 @@ function ProjectsView({ projects, keys, onChanged, notify }: Props) {
   }
 
   async function handleInject(project: ProjectInfo) {
+    const target = project.path ?? "(未設定)";
+    if (
+      !window.confirm(
+        `${project.name} のキーを次の場所の .env に書き出します:\n${target}\n\n` +
+          "APIキーの生の値がファイルに書き込まれます。よろしいですか?",
+      )
+    ) {
+      return;
+    }
     try {
       const result = await inject(project.name);
       notify(`${result.env_path} に書き出しました: ${result.written.join(", ")}`, null);
