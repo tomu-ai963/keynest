@@ -1,6 +1,6 @@
 //! vault の高レベル API。Tauri コマンド層はこのモジュールだけを呼ぶ。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -13,6 +13,9 @@ use crate::error::{Error, Result};
 pub struct Vault {
     pub(super) conn: Connection,
     pub(super) store: Box<dyn SecretStore>,
+    /// scan_preview で検出した .env の絶対パス集合。
+    /// scan_apply はこの集合に含まれるパスしか受理しない(任意パス読み取りの防止)。
+    pub(super) scanned_paths: HashSet<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,15 +108,22 @@ impl FoundKey {
     }
 }
 
-/// 値のマスク表示。12文字以上なら先頭4+末尾4、未満なら全て伏せる。
+/// 値のマスク表示。
+/// - 20文字以上のときだけ末尾4文字を見せる(それ未満は全マスク)。
+/// - 先頭に露出してよいのは公知のプレフィックス(sk-ant- 等)だけ。
+///   任意のキーの先頭数文字は決して露出しない。
+///
+/// このマスク文字列はローテーション履歴として SQLite に永続化されるため、
+/// 露出範囲は「公開情報のプレフィックス + 末尾4文字」に厳しく限定する。
 pub fn mask(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
-    if chars.len() >= 12 {
-        let head: String = chars[..4].iter().collect();
-        let tail: String = chars[chars.len() - 4..].iter().collect();
-        format!("{head}…{tail}")
-    } else {
-        "*".repeat(chars.len())
+    if chars.len() < 20 {
+        return "*".repeat(chars.len());
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    match super::presets::known_prefix(value) {
+        Some(prefix) => format!("{prefix}…{tail}"),
+        None => format!("…{tail}"),
     }
 }
 
@@ -126,6 +136,7 @@ impl Vault {
         Ok(Self {
             conn: db::open(db_path)?,
             store,
+            scanned_paths: HashSet::new(),
         })
     }
 
@@ -205,7 +216,7 @@ impl Vault {
         }
         let service_id = self.get_or_create_service(service)?;
 
-        let Self { conn, store } = self;
+        let Self { conn, store, .. } = self;
         let tx = conn.transaction()?;
         let existing: Option<i64> = tx
             .query_row(
@@ -216,6 +227,16 @@ impl Vault {
             .optional()?;
         let (key_id, action) = match existing {
             Some(key_id) => {
+                // 上書きで旧値が失われる前に、マスクをローテーション履歴へ残す
+                // (rotate_key と同じ扱い。値が変わらない場合は記録しない)。
+                if let Some(old_value) = store.get(key_id)? {
+                    if old_value != value {
+                        tx.execute(
+                            "INSERT INTO key_rotations (key_id, old_value_masked) VALUES (?1, ?2)",
+                            params![key_id, mask(&old_value)],
+                        )?;
+                    }
+                }
                 tx.execute(
                     "UPDATE keys SET env_var_name = ?1, expires_at = ?2, note = ?3,
                                      last_validated_at = NULL
@@ -347,7 +368,7 @@ impl Vault {
             return Err(Error::InvalidInput("new_value が空です".into()));
         }
         let key = self.find_key(service, name)?;
-        let Self { conn, store } = self;
+        let Self { conn, store, .. } = self;
         let old_value = store.get(key.id)?;
         if old_value.as_deref() == Some(new_value) {
             return Err(Error::InvalidInput("新しい値が現在の値と同じです".into()));
@@ -611,7 +632,12 @@ mod tests {
 
     #[test]
     fn mask_long_and_short_values() {
-        assert_eq!(mask("sk-ant-api03-abcdef3f2x"), "sk-a…3f2x");
+        // 20文字以上: 公知プレフィックス + 末尾4文字だけ露出
+        assert_eq!(mask("sk-ant-api03-abcdef3f2x"), "sk-ant-…3f2x");
+        // 公知プレフィックスがない長いキーは末尾4文字のみ
+        assert_eq!(mask("abcdefghij0123456789"), "…6789");
+        // 20文字未満は全マスク(先頭は一切出さない)
+        assert_eq!(mask("re_123456789012"), "***************");
         assert_eq!(mask("short"), "*****");
         assert_eq!(mask(""), "");
     }
@@ -677,6 +703,38 @@ mod tests {
         let keys = vault.list_keys(Some("openai")).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].env_var_name, "OPENAI_KEY");
+
+        // 上書きで旧値のマスクがローテーション履歴に残る
+        let history = vault.list_rotations("openai", None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].old_value_masked, mask("sk-proj-original-value"));
+    }
+
+    #[test]
+    fn set_key_overwrite_with_same_value_records_no_history() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "openai",
+                "default",
+                "sk-proj-unchanged-value",
+                "OPENAI_API_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        // 同じ値で保存し直してもメタデータ更新のみ。履歴は増やさない
+        vault
+            .set_key(
+                "openai",
+                "default",
+                "sk-proj-unchanged-value",
+                "OPENAI_API_KEY",
+                None,
+                Some("メモだけ変更"),
+            )
+            .unwrap();
+        assert!(vault.list_rotations("openai", None).unwrap().is_empty());
     }
 
     #[test]
@@ -889,7 +947,7 @@ mod tests {
             .unwrap();
         assert_eq!(rotated.key, "stripe/default");
         assert!(!rotated.value_masked.contains("rotated-value"));
-        assert_eq!(rotated.old_value_masked.as_deref(), Some("sk_l…alue"));
+        assert_eq!(rotated.old_value_masked.as_deref(), Some("sk_live_…alue"));
         assert_eq!(
             store.get(result.key_id).unwrap().as_deref(),
             Some("sk_live_rotated-value!")
@@ -898,7 +956,7 @@ mod tests {
         // 履歴に旧値のマスクだけが残り、ローテーション後は未検証に戻る
         let history = vault.list_rotations("stripe", None).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].old_value_masked, "sk_l…alue");
+        assert_eq!(history[0].old_value_masked, "sk_live_…alue");
         let keys = vault.list_keys(Some("stripe")).unwrap();
         assert_eq!(keys[0].last_validated_at, None);
 

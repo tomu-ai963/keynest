@@ -268,10 +268,28 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
+/// 値が公知のプレフィックス(sk-ant- 等)で始まる場合、そのプレフィックスを返す。
+/// マスク表示の先頭に露出してよいのはこの範囲(=公開情報)だけ。
+/// 複数該当する場合はより長い(具体的な)プレフィックスを優先する。
+pub fn known_prefix(value: &str) -> Option<&'static str> {
+    PRESETS
+        .iter()
+        .flat_map(|p| p.value_prefixes.iter().copied())
+        .filter(|pre| value.starts_with(pre))
+        .max_by_key(|pre| pre.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn known_prefix_matches_public_prefixes_only() {
+        assert_eq!(known_prefix("sk-ant-api03-secret"), Some("sk-ant-"));
+        assert_eq!(known_prefix("sk_live_abcdef"), Some("sk_live_"));
+        assert_eq!(known_prefix("random-value-no-prefix"), None);
+    }
 
     #[test]
     fn has_30_presets_with_unique_ids() {
