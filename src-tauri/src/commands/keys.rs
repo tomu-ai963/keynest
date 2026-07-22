@@ -62,16 +62,22 @@ pub fn delete_key(
 }
 
 #[tauri::command]
-pub fn validate_key(
+pub async fn validate_key(
     state: State<'_, VaultState>,
     service: String,
     name: Option<String>,
 ) -> Result<ValidateResult, Error> {
-    // プロバイダ API はタイムアウトまで最大15秒かかるため、ネットワーク検証中は
-    // ロックを保持しない: begin(ロック内) → run(ロック外) → finish(ロック内)。
-    let (pending, value) = state.vault()?.begin_validation(&service, name.as_deref())?;
-    let outcome = pending.run(&value)?;
-    state.vault()?.finish_validation(&pending, outcome)
+    // プロバイダ API はタイムアウトまで最大15秒かかるため、
+    // begin(ロック内) → run(ロック外・ワーカースレッド) → finish(ロック内)の3段にし、
+    // ネットワーク検証中は vault のロックもメインスレッドも塞がない。
+    let pending = state.vault()?.begin_validation(&service, name.as_deref())?;
+    let (pending, outcome) = tauri::async_runtime::spawn_blocking(move || {
+        let outcome = pending.run();
+        (pending, outcome)
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("検証タスクの実行に失敗しました: {e}")))?;
+    state.vault()?.finish_validation(&pending, outcome?)
 }
 
 #[tauri::command]

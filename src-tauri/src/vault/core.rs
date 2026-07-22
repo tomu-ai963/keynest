@@ -97,16 +97,19 @@ pub struct RotationInfo {
 
 /// キー検証の途中状態。begin_validation で作り、run でネットワーク検証を行い、
 /// finish_validation で結果を記録する。run は Vault のロックを持たずに呼べる。
+/// フィールドは非公開: begin_validation を経由せずに finish_validation へ渡せる値を
+/// 作れないようにし、生のキー値もコマンド層へ露出させない。
 pub struct PendingValidation {
-    pub key_id: i64,
-    pub label: String,
-    pub service: String,
+    key_id: i64,
+    label: String,
+    service: String,
+    value: String,
 }
 
 impl PendingValidation {
     /// プロバイダ API を叩いてキーの生死を確認する(タイムアウトまで最大15秒)。
-    pub fn run(&self, value: &str) -> Result<validate::Validation> {
-        validate::validate(&self.service, value)
+    pub fn run(&self) -> Result<validate::Validation> {
+        validate::validate(&self.service, &self.value)
     }
 }
 
@@ -452,12 +455,8 @@ impl Vault {
 
     /// 検証対象キーの特定と生値の取り出しだけを行う(ネットワークには触れない)。
     /// プロバイダ API の呼び出しは最大15秒かかるため、コマンド層はこの後ロックを
-    /// 手放してから validate::validate を実行し、finish_validation で結果を記録する。
-    pub fn begin_validation(
-        &self,
-        service: &str,
-        name: Option<&str>,
-    ) -> Result<(PendingValidation, String)> {
+    /// 手放してから PendingValidation::run を実行し、finish_validation で結果を記録する。
+    pub fn begin_validation(&self, service: &str, name: Option<&str>) -> Result<PendingValidation> {
         let key = self.find_key(service, name)?;
         let Some(value) = self.store.get(key.id)? else {
             return Err(Error::NotFound(format!(
@@ -465,14 +464,12 @@ impl Vault {
                 key.label()
             )));
         };
-        Ok((
-            PendingValidation {
-                key_id: key.id,
-                label: key.label(),
-                service: key.service,
-            },
+        Ok(PendingValidation {
+            key_id: key.id,
+            label: key.label(),
+            service: key.service,
             value,
-        ))
+        })
     }
 
     /// 検証結果を記録して ValidateResult を組み立てる。
@@ -482,7 +479,10 @@ impl Vault {
         pending: &PendingValidation,
         outcome: validate::Validation,
     ) -> Result<ValidateResult> {
-        if outcome.ok {
+        // 検証中に rotate_key / set_key で値が差し替わっていた場合、検証したのは
+        // 旧値なので last_validated_at は更新しない(新値は未検証のまま残す)。
+        let unchanged = self.store.get(pending.key_id)?.as_deref() == Some(&pending.value);
+        if outcome.ok && unchanged {
             self.conn.execute(
                 "UPDATE keys SET last_validated_at = datetime('now') WHERE id = ?1",
                 [pending.key_id],
@@ -1154,11 +1154,8 @@ mod tests {
             )
             .unwrap();
         // 未対応サービスはネットワークに触れる前(run)に拒否される
-        let (pending, value) = vault.begin_validation("myapp", None).unwrap();
-        assert!(matches!(
-            pending.run(&value).unwrap_err(),
-            Error::InvalidInput(_)
-        ));
+        let pending = vault.begin_validation("myapp", None).unwrap();
+        assert!(matches!(pending.run().unwrap_err(), Error::InvalidInput(_)));
         // validatable フラグはバリデータ対応表と一致する
         let keys = vault.list_keys(None).unwrap();
         assert!(!keys[0].validatable);
@@ -1176,11 +1173,86 @@ mod tests {
         assert!(keys[0].validatable);
     }
 
+    fn ok_validation() -> validate::Validation {
+        validate::Validation {
+            ok: true,
+            detail: "HTTP 200".into(),
+        }
+    }
+
+    #[test]
+    fn finish_validation_records_timestamp_when_value_unchanged() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "stripe",
+                "default",
+                "sk_live_same-value!!",
+                "STRIPE_SECRET_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        let pending = vault.begin_validation("stripe", None).unwrap();
+        let result = vault.finish_validation(&pending, ok_validation()).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.key, "stripe/default");
+        assert!(result.last_validated_at.is_some());
+    }
+
+    #[test]
+    fn finish_validation_skips_timestamp_when_rotated_mid_flight() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "stripe",
+                "default",
+                "sk_live_original-value",
+                "STRIPE_SECRET_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        let pending = vault.begin_validation("stripe", None).unwrap();
+        // ロック外での検証中にローテーションが走ったケース。
+        // 検証したのは旧値なので、新値が検証済み扱いになってはいけない
+        vault
+            .rotate_key("stripe", None, "sk_live_rotated-value!")
+            .unwrap();
+        let result = vault.finish_validation(&pending, ok_validation()).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.last_validated_at, None);
+        let keys = vault.list_keys(Some("stripe")).unwrap();
+        assert_eq!(keys[0].last_validated_at, None);
+    }
+
+    #[test]
+    fn finish_validation_reports_not_found_when_deleted_mid_flight() {
+        let (mut vault, _store, _dir) = test_vault();
+        vault
+            .set_key(
+                "stripe",
+                "default",
+                "sk_live_same-value!!",
+                "STRIPE_SECRET_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        let pending = vault.begin_validation("stripe", None).unwrap();
+        vault.delete_key("stripe", None).unwrap();
+        let err = vault
+            .finish_validation(&pending, ok_validation())
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
     #[test]
     fn validate_expires_at_accepts_dates_and_iso8601_datetimes() {
         for ok in [
             "2026-12-31",
             "2028-02-29", // うるう年
+            "2000-02-29", // 400年例外(うるう年)
             "2026-07-22T10:30",
             "2026-07-22 10:30:59",
             "2026-07-22T10:30:00.123",
@@ -1198,6 +1270,7 @@ mod tests {
             "2026-00-10",
             "2026-02-30",
             "2027-02-29", // 平年
+            "2100-02-29", // 100年例外(平年)
             "26-07-22",
             "2026-7-2",
             "2026-07-22x",

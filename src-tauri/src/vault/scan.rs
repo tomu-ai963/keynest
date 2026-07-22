@@ -346,9 +346,8 @@ impl Vault {
             let text = match std::fs::read_to_string(env_file) {
                 Ok(text) => text,
                 Err(e) => {
-                    // 読めないファイルは黙殺せず、ファイル単位のエラーとして報告する。
+                    // 読めないファイルは黙殺せず、ファイル単位のエラーとして UI に報告する。
                     // scanned_paths にも登録しない(scan_apply で読めないため)。
-                    eprintln!("scan: 読み取り失敗 / failed to read {file}: {e}");
                     files.push(ScanFile {
                         file,
                         project,
