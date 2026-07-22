@@ -90,6 +90,8 @@ export interface ScanFile {
   file: string;
   project: string;
   entries: ScanEntry[];
+  /** ファイルを読み取れなかった場合の理由 */
+  error: string | null;
 }
 
 export interface ScanReport {

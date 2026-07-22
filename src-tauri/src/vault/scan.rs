@@ -71,6 +71,8 @@ pub struct ScanFile {
     /// .env のあるディレクトリ名(適用時のプロジェクト名になる)
     pub project: String,
     pub entries: Vec<ScanEntry>,
+    /// ファイルを読み取れなかった場合の理由(黙殺せず UI に表示する)
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -340,7 +342,22 @@ impl Vault {
         let mut files = Vec::new();
         for env_file in &env_files {
             let (project, _) = project_of(env_file);
-            let text = std::fs::read_to_string(env_file).unwrap_or_default();
+            let file = env_file.to_string_lossy().into_owned();
+            let text = match std::fs::read_to_string(env_file) {
+                Ok(text) => text,
+                Err(e) => {
+                    // 読めないファイルは黙殺せず、ファイル単位のエラーとして報告する。
+                    // scanned_paths にも登録しない(scan_apply で読めないため)。
+                    eprintln!("scan: 読み取り失敗 / failed to read {file}: {e}");
+                    files.push(ScanFile {
+                        file,
+                        project,
+                        entries: Vec::new(),
+                        error: Some(format!("読み取れませんでした: {e}")),
+                    });
+                    continue;
+                }
+            };
             let mut entries = Vec::new();
             for (var, value) in parse_env(&text) {
                 let entry = if !looks_like_secret(&var, &value) {
@@ -375,12 +392,12 @@ impl Vault {
                 *summary.entry(entry.status).or_default() += 1;
                 entries.push(entry);
             }
-            let file = env_file.to_string_lossy().into_owned();
             self.scanned_paths.insert(file.clone());
             files.push(ScanFile {
                 file,
                 project,
                 entries,
+                error: None,
             });
         }
         Ok(ScanReport {
@@ -408,7 +425,14 @@ impl Vault {
         for sel in selections {
             let env_file = Path::new(&sel.file);
             let (project, project_path) = project_of(env_file);
-            let text = std::fs::read_to_string(env_file).unwrap_or_default();
+            // 読み取り失敗を「全変数 missing」として黙殺せず、取り込み全体を中断する
+            // (トランザクションごとロールバックされる)。
+            let text = std::fs::read_to_string(env_file).map_err(|e| {
+                Error::InvalidInput(format!(
+                    "{} を読み取れませんでした。ファイルを確認して再スキャンしてください: {e}",
+                    sel.file
+                ))
+            })?;
             let values: HashMap<String, String> = parse_env(&text).into_iter().collect();
             for var in &sel.vars {
                 let entry = match values.get(var) {
@@ -725,6 +749,65 @@ NOEQUAL
         assert!(matches!(err, Error::InvalidInput(_)));
         // 取り込みは一切起きていない
         assert!(vault.list_keys(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_aborts_when_scanned_file_becomes_unreadable() {
+        let (mut vault, _store, _dir) = test_vault();
+        let project = TempDir::new().unwrap();
+        let env_file = write(
+            project.path(),
+            "my-app/.env",
+            "RESEND_API_KEY=re_123456789012\n",
+        );
+        let preview = vault
+            .scan_preview(project.path().to_str().unwrap(), 3)
+            .unwrap();
+        // プレビューと適用の間にファイルが消えた場合、
+        // 「全変数 missing」ではなく明確なエラーで中断する
+        std::fs::remove_file(&env_file).unwrap();
+        let err = vault
+            .scan_apply(&[ScanSelection {
+                file: preview.files[0].file.clone(),
+                vars: vec!["RESEND_API_KEY".into()],
+            }])
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+        assert!(err.to_string().contains("読み取れませんでした"));
+        // ロールバックされ、部分的な取り込みは残らない
+        assert!(vault.list_keys(None).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_reports_unreadable_file_instead_of_silence() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut vault, _store, _dir) = test_vault();
+        let project = TempDir::new().unwrap();
+        let env_file = write(
+            project.path(),
+            "my-app/.env",
+            "RESEND_API_KEY=re_123456789012\n",
+        );
+        std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = vault
+            .scan_preview(project.path().to_str().unwrap(), 3)
+            .unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert!(report.files[0].error.is_some());
+        assert!(report.files[0].entries.is_empty());
+        // 読めなかったファイルは scan_apply でも受理されない
+        let err = vault
+            .scan_apply(&[ScanSelection {
+                file: report.files[0].file.clone(),
+                vars: vec!["RESEND_API_KEY".into()],
+            }])
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+
+        // TempDir の削除が失敗しないよう権限を戻す
+        std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]

@@ -37,8 +37,31 @@ pub fn merge(env_path: &Path, updates: &HashMap<String, String>) -> Result<()> {
         out.push(format!("{var}={value}"));
     }
 
-    std::fs::write(env_path, out.join("\n") + "\n")?;
+    write_env(env_path, &(out.join("\n") + "\n"))?;
     Ok(())
+}
+
+/// .env を書き出す。シークレットを含むため、Unix では umask に依存せず
+/// パーミッションを所有者のみ読み書き可(600)に固定する。
+#[cfg(unix)]
+fn write_env(env_path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(env_path)?;
+    // mode は新規作成時にしか効かないため、既存ファイルにも明示的に適用する
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(content.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_env(env_path: &Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(env_path, content)
 }
 
 #[cfg(test)]
@@ -69,5 +92,24 @@ mod tests {
         merge(&path, &updates(&[("A_KEY", "new"), ("B_KEY", "added")])).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "# comment\nOTHER=keep\nA_KEY=new\nB_KEY=added\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+
+        // 新規作成時: umask に関係なく 600
+        merge(&path, &updates(&[("A_KEY", "value-a")])).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // 既存ファイルが緩い権限でも 600 に絞られる
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        merge(&path, &updates(&[("B_KEY", "value-b")])).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

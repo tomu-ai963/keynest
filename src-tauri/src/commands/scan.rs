@@ -10,11 +10,7 @@ pub fn scan_preview(
     path: String,
     max_depth: Option<u32>,
 ) -> Result<ScanReport, Error> {
-    state
-        .0
-        .lock()
-        .unwrap()
-        .scan_preview(&path, max_depth.unwrap_or(3))
+    state.vault()?.scan_preview(&path, max_depth.unwrap_or(3))
 }
 
 #[tauri::command]
@@ -22,5 +18,5 @@ pub fn scan_apply(
     state: State<'_, VaultState>,
     selections: Vec<ScanSelection>,
 ) -> Result<ScanApplyReport, Error> {
-    state.0.lock().unwrap().scan_apply(&selections)
+    state.vault()?.scan_apply(&selections)
 }

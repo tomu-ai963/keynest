@@ -12,6 +12,8 @@ pub enum Error {
     NotFound(String),
     #[error("{0}")]
     Ambiguous(String),
+    #[error("{0}")]
+    Internal(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
