@@ -30,6 +30,10 @@ UIに表示されるのは常にマスク値(`sk-ant-…3f2x`)のみ。マスク
 - キーの生死確認(対応: Anthropic / Cloudflare / GitHub / OpenAI / Resend / Stripe)
 - ローテーション履歴(旧値はマスクのみ保存)・有効期限アラート(期限切れ / 30日以内)
 
+## 制限事項
+
+- **Windows: 1キーあたり約2.5KBまで。** キーの値は Windows 資格情報マネージャーに保存されるため、1エントリの上限(約2,560バイト)を超える値(サービスアカウントの JSON キーなどの長大なシークレット)は保存できません。超過時は「キーが長すぎてこのOSのセキュアストレージに保存できません(上限 n バイト)」というエラーになります。macOS Keychain / Linux Secret Service の上限は十分大きいため、通常は影響しません。
+
 ## インストール
 
 [Releases](https://github.com/tomu-ai963/keynest/releases) から各OS向けのインストーラをダウンロードしてください。

@@ -55,18 +55,26 @@ pub mod memory {
     #[derive(Clone, Default)]
     pub struct MemoryStore(pub Arc<Mutex<HashMap<i64, String>>>);
 
+    impl MemoryStore {
+        /// 単なる HashMap なので、毒化していても中身は壊れていない。
+        /// テスト中の panic に巻き込まれないよう回復して続行する。
+        fn map(&self) -> std::sync::MutexGuard<'_, HashMap<i64, String>> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
     impl SecretStore for MemoryStore {
         fn set(&self, key_id: i64, value: &str) -> Result<()> {
-            self.0.lock().unwrap().insert(key_id, value.to_string());
+            self.map().insert(key_id, value.to_string());
             Ok(())
         }
 
         fn get(&self, key_id: i64) -> Result<Option<String>> {
-            Ok(self.0.lock().unwrap().get(&key_id).cloned())
+            Ok(self.map().get(&key_id).cloned())
         }
 
         fn delete(&self, key_id: i64) -> Result<()> {
-            self.0.lock().unwrap().remove(&key_id);
+            self.map().remove(&key_id);
             Ok(())
         }
     }
