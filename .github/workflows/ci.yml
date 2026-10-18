@@ -24,6 +24,7 @@ jobs:
   rust:
     name: Rust (fmt + clippy + test)
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -55,4 +56,10 @@ jobs:
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # DEBUG(一時): ubuntu で cargo test がハングする原因調査。原因特定後に `cargo test` へ戻す
+      - run: cargo test --no-run
+      - run: timeout --signal=KILL 600 cargo test -- --test-threads=1 --nocapture
+        shell: bash
+        if: runner.os == 'Linux'
       - run: cargo test
+        if: runner.os != 'Linux'
