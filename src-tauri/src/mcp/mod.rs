@@ -240,14 +240,44 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [
-                "list_keys",
-                "list_projects",
-                "assign_key",
-                "inject_env",
-                "run_with_keys"
-            ]
+            ["list_keys", "list_projects", "inject_env", "run_with_keys"]
         );
+    }
+
+    #[test]
+    fn assign_key_is_not_exposed() {
+        // 紐づけは GUI のみ。MCP から呼んでも未知のツールとして拒否され、紐づけは増えない
+        let project_dir = TempDir::new().unwrap();
+        let (mut vault, _db) = vault_with_project(project_dir.path());
+        vault
+            .set_key(
+                "stripe",
+                "live",
+                "stripe-dummy-value-for-test-0000",
+                "STRIPE_SECRET_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        let (_, resp) = roundtrip(
+            &mut vault,
+            &[call(
+                1,
+                "assign_key",
+                json!({ "service": "stripe", "project": "app" }),
+            )],
+        );
+        assert_eq!(resp[0]["error"]["code"], -32602);
+        assert!(resp[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("assign_key"));
+        let keys: Vec<String> = vault.list_projects().unwrap()[0]
+            .keys
+            .iter()
+            .map(|k| k.env_var_name.clone())
+            .collect();
+        assert_eq!(keys, ["ANTHROPIC_API_KEY"]);
     }
 
     #[test]
@@ -278,10 +308,7 @@ mod tests {
         let (_, resp) = roundtrip(&mut vault, &[call(2, "get_key", json!({}))]);
         assert_eq!(resp[0]["error"]["code"], -32602);
 
-        let (_, resp) = roundtrip(
-            &mut vault,
-            &[call(3, "assign_key", json!({ "service": 1 }))],
-        );
+        let (_, resp) = roundtrip(&mut vault, &[call(3, "list_keys", json!({ "service": 1 }))]);
         let (text, is_error) = tool_text(&resp[0]);
         assert!(is_error);
         assert!(text.contains("service"), "{text}");
@@ -289,19 +316,9 @@ mod tests {
 
     #[test]
     fn raw_value_never_appears_in_any_response() {
-        let (mut vault, dir) = test_vault();
-        let project_dir = dir.path().join("app");
-        std::fs::create_dir(&project_dir).unwrap();
-        vault
-            .set_key(
-                "anthropic",
-                "default",
-                SECRET,
-                "ANTHROPIC_API_KEY",
-                None,
-                None,
-            )
-            .unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let project_dir = project_dir.path();
+        let (mut vault, _db) = vault_with_project(project_dir);
         let echo = if cfg!(windows) {
             "echo %ANTHROPIC_API_KEY%"
         } else {
@@ -310,12 +327,7 @@ mod tests {
         let (raw, resp) = roundtrip(
             &mut vault,
             &[
-                call(
-                    1,
-                    "assign_key",
-                    json!({ "service": "anthropic", "project": "app",
-                                              "project_path": project_dir.to_str().unwrap() }),
-                ),
+                call(1, "list_projects", json!({})),
                 call(2, "list_keys", json!({})),
                 call(3, "list_projects", json!({})),
                 call(4, "inject_env", json!({ "project": "app" })),
@@ -433,25 +445,15 @@ mod tests {
 
         let (_, resp) = roundtrip(
             &mut vault,
-            &[
-                call(
-                    1,
-                    "inject_env",
-                    json!({ "project": "app", "path": other_path }),
-                ),
-                call(
-                    2,
-                    "assign_key",
-                    json!({ "service": "anthropic", "project": "app",
-                                              "project_path": other_path }),
-                ),
-            ],
+            &[call(
+                1,
+                "inject_env",
+                json!({ "project": "app", "path": other_path }),
+            )],
         );
-        for r in &resp {
-            let (text, is_error) = tool_text(r);
-            assert!(is_error, "{text}");
-            assert!(text.contains("KeyNest アプリ"), "{text}");
-        }
+        let (text, is_error) = tool_text(&resp[0]);
+        assert!(is_error, "{text}");
+        assert!(text.contains("KeyNest アプリ"), "{text}");
         assert!(
             !other.path().join(".env").exists(),
             "別ディレクトリに .env が書き出されている"

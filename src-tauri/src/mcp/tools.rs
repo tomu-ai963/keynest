@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 
 use super::runner;
 use crate::error::{Error, Result};
-use crate::vault::core::{AssignResult, InjectResult, Vault};
+use crate::vault::core::{InjectResult, Vault};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
@@ -36,20 +36,6 @@ pub fn definitions() -> Value {
             "description": "List KeyNest projects with their directory and the keys (env var names) assigned to each.",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true }
-        },
-        {
-            "name": "assign_key",
-            "description": "Assign a stored key to a project so it can be used by inject_env / run_with_keys. Creates the project if it does not exist.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "service": { "type": "string" },
-                    "name": { "type": "string", "description": "Key name. Optional when the service has only one key." },
-                    "project": { "type": "string" },
-                    "project_path": { "type": "string", "description": "Absolute path of the project directory. Can only be set when the project has no path yet; changing it requires the KeyNest app." }
-                },
-                "required": ["service", "project"]
-            }
         },
         {
             "name": "inject_env",
@@ -109,33 +95,12 @@ pub fn call(
     match name {
         "list_keys" => to_value(vault.list_keys(opt_str(args, "service")?)?),
         "list_projects" => to_value(vault.list_projects()?),
-        "assign_key" => to_value(assign_key(vault, args)?),
         "inject_env" => to_value(inject_env(vault, args)?),
         "run_with_keys" => to_value(run_with_keys(vault, args)?),
+        // キーとプロジェクトの紐づけ・プロジェクトのパス設定は意図的に公開しない。
+        // AI が使えるキーの範囲と書き込み・実行先は、ユーザーが GUI で決める。
         other => Err(CallError::Unknown(other.to_string())),
     }
-}
-
-/// 保存済みのプロジェクトパスは inject_env / run_with_keys の書き込み・実行先になり、
-/// GUI からの書き出しにも使われる。MCP 経由では新規設定のみ許し、変更は GUI に限る。
-fn assign_key(vault: &mut Vault, args: &Map<String, Value>) -> Result<AssignResult> {
-    let service = req_str(args, "service")?;
-    let name = opt_str(args, "name")?;
-    let project = req_str(args, "project")?;
-    let project_path = opt_str(args, "project_path")?;
-    if let Some(new_path) = project_path {
-        match vault.find_project(project) {
-            Ok((_, Some(stored))) if stored != new_path => {
-                return Err(Error::InvalidInput(format!(
-                    "プロジェクト {project} のパスは設定済みです({stored})。\
-                     パスの変更は KeyNest アプリで行ってください"
-                )));
-            }
-            Ok(_) | Err(Error::NotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    vault.assign_key(service, name, project, project_path)
 }
 
 fn inject_env(vault: &mut Vault, args: &Map<String, Value>) -> Result<InjectResult> {

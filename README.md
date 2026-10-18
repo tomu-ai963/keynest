@@ -38,11 +38,10 @@ UIに表示されるのは常にマスク値(`sk-ant-…3f2x`)のみ。マスク
 |---|---|
 | `list_keys` | キー一覧(サービス・環境変数名・期限・使用プロジェクト。値は含まない) |
 | `list_projects` | プロジェクトと紐づくキーの一覧 |
-| `assign_key` | キーをプロジェクトに紐づける |
 | `inject_env` | プロジェクトのキーを `<プロジェクト>/.env` に書き出す(返すのは変数名のみ)。git リポジトリ内では `.env` が `.gitignore` で除外されている場合に限る |
 | `run_with_keys` | キーを環境変数に注入してプロジェクトのディレクトリでコマンドを実行する。出力に値が含まれていれば `[REDACTED:環境変数名]` に置き換えて返す(UTF-16・URL エンコード・JSON エスケープされた形も対象) |
 
-プロジェクトのパス(`.env` の書き出し先・コマンドの実行先)は、MCP からは未設定のときに設定できるだけで、変更は KeyNest アプリでのみ行えます。
+**キーとプロジェクトの紐づけ、プロジェクトのパス(`.env` の書き出し先・コマンドの実行先)の設定は KeyNest アプリでのみ行えます。** AI が使えるキーの範囲と書き込み先を決めるのは常にユーザーで、MCP からは変更できません。
 
 ### セットアップ
 
@@ -54,13 +53,14 @@ cargo build --release --manifest-path src-tauri/Cargo.toml --bin keynest-mcp
 claude mcp add keynest -- /path/to/keynest/src-tauri/target/release/keynest-mcp
 ```
 
-GUI と同じ DB(`<データディレクトリ>/com.tomuai.keynest/keynest.db`、環境変数 `KEYNEST_DB` で上書き可)を使います。先に KeyNest アプリを一度起動して DB を作成しておいてください。`run_with_keys` で使えるのは、パスが設定されたプロジェクトに紐づけたキーだけです。
+GUI と同じ DB(`<データディレクトリ>/com.tomuai.keynest/keynest.db`、環境変数 `KEYNEST_DB` で上書き可)を使います。先に KeyNest アプリを一度起動して DB を作成しておいてください。使う前に、アプリの「プロジェクト」でキーを紐づけ、パスを設定してください。`run_with_keys` / `inject_env` で使えるのは、そのプロジェクトに紐づけたキーだけです。
 
 ### 注意(脅威モデル)
 
 伏せ字への置き換えは「**値がうっかり会話に載る**」のを防ぐ仕組みで、AI の挙動を制限する境界ではありません。`run_with_keys` は任意のコマンドを実行でき、エンコードして出力するなど意図的に持ち出す手段は残ります。また `inject_env` で書き出した `.env` は、AI がファイルとして読める場所にあります。
 
-- `run_with_keys` / `inject_env` / `assign_key` は **常時許可(allow)に入れず、呼び出しごとに承認する**ことを推奨します。読み取り専用の `list_keys` / `list_projects` だけを許可するのが目安です。
+- AI に使わせるキーだけをプロジェクトに紐づけてください(本番の決済キーなどは、必要なとき以外は紐づけない)。
+- `run_with_keys` / `inject_env` は **常時許可(allow)に入れず、呼び出しごとに承認する**ことを推奨します。読み取り専用の `list_keys` / `list_projects` だけを許可するのが目安です。
 - 承認時は、実行されるコマンドの内容を確認してください。
 
 ## 制限事項
