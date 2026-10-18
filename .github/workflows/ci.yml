@@ -58,8 +58,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       # DEBUG(一時): ubuntu で cargo test がハングする原因調査。原因特定後に `cargo test` へ戻す
       - run: cargo test --no-run
-      - run: timeout --signal=KILL 600 cargo test -- --test-threads=1 --nocapture
-        shell: bash
-        if: runner.os == 'Linux'
+      # runner ごと止まりログが残らないため、ステップを分けてどこで止まるかをステップの状態で特定する
+      - name: "debug 1/6: vault"
+        run: timeout --signal=KILL 300 cargo test --lib vault:: -- --test-threads=1
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+      - name: "debug 2/6: redact"
+        run: timeout --signal=KILL 300 cargo test --lib mcp::runner::tests::redact -- --test-threads=1
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+      - name: "debug 3/6: run_injects_env_and_redacts_output"
+        run: timeout --signal=KILL 300 cargo test --lib mcp::runner::tests::run_injects_env_and_redacts_output -- --exact --nocapture
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+      - name: "debug 4/6: run_reports_nonzero_exit_code"
+        run: timeout --signal=KILL 300 cargo test --lib mcp::runner::tests::run_reports_nonzero_exit_code -- --exact --nocapture
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+      - name: "debug 5/6: run_times_out"
+        run: timeout --signal=KILL 300 cargo test --lib mcp::runner::tests::run_times_out -- --exact --nocapture
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+      - name: "debug 6/6: mcp tools"
+        run: timeout --signal=KILL 300 cargo test --lib mcp::tests:: -- --test-threads=1 --nocapture
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
       - run: cargo test
         if: runner.os != 'Linux'
