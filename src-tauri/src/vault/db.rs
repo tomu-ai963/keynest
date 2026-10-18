@@ -19,6 +19,8 @@ pub fn open(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    // GUI と keynest-mcp が同じ DB を同時に開くため、ロック競合は即エラーにせず待つ
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", true)?;
     migrate(&conn)?;
     Ok(conn)

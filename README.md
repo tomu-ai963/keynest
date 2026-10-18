@@ -30,6 +30,37 @@ UIに表示されるのは常にマスク値(`sk-ant-…3f2x`)のみ。マスク
 - キーの生死確認(対応: Anthropic / Cloudflare / GitHub / OpenAI / Resend / Stripe)
 - ローテーション履歴(旧値はマスクのみ保存)・有効期限アラート(期限切れ / 30日以内)
 
+## Claude Code から使う(MCP サーバー)
+
+`keynest-mcp` は KeyNest のキーを Claude Code などの MCP クライアントから使うための stdio サーバーです。**キーの値そのものは AI に渡しません。** 値を会話に載せると、API への送信内容やセッションのログに平文で残るためです。代わりに、KeyNest が値を `.env` やコマンドの環境変数に直接注入します。
+
+| ツール | 内容 |
+|---|---|
+| `list_keys` | キー一覧(サービス・環境変数名・期限・使用プロジェクト。値は含まない) |
+| `list_projects` | プロジェクトと紐づくキーの一覧 |
+| `assign_key` | キーをプロジェクトに紐づける |
+| `inject_env` | プロジェクトのキーを `<プロジェクト>/.env` に書き出す(返すのは変数名のみ) |
+| `run_with_keys` | キーを環境変数に注入してプロジェクトのディレクトリでコマンドを実行する。出力に値が含まれていれば `[REDACTED:環境変数名]` に置き換えて返す |
+
+### セットアップ
+
+```sh
+# ビルド(現時点ではインストーラに同梱していません)
+cargo build --release --manifest-path src-tauri/Cargo.toml --bin keynest-mcp
+
+# Claude Code に登録
+claude mcp add keynest -- /path/to/keynest/src-tauri/target/release/keynest-mcp
+```
+
+GUI と同じ DB(`<データディレクトリ>/com.tomuai.keynest/keynest.db`、環境変数 `KEYNEST_DB` で上書き可)を使います。先に KeyNest アプリを一度起動して DB を作成しておいてください。`run_with_keys` で使えるのは、パスが設定されたプロジェクトに紐づけたキーだけです。
+
+### 注意(脅威モデル)
+
+伏せ字への置き換えは「**値がうっかり会話に載る**」のを防ぐ仕組みで、AI の挙動を制限する境界ではありません。`run_with_keys` は任意のコマンドを実行でき、エンコードして出力するなど意図的に持ち出す手段は残ります。また `inject_env` で書き出した `.env` は、AI がファイルとして読める場所にあります。
+
+- `run_with_keys` / `inject_env` / `assign_key` は **常時許可(allow)に入れず、呼び出しごとに承認する**ことを推奨します。読み取り専用の `list_keys` / `list_projects` だけを許可するのが目安です。
+- 承認時は、実行されるコマンドの内容を確認してください。
+
 ## 制限事項
 
 - **Windows: 1キーあたり約2.5KBまで。** キーの値は Windows 資格情報マネージャーに保存されるため、1エントリの上限(約2,560バイト)を超える値(サービスアカウントの JSON キーなどの長大なシークレット)は保存できません。超過時は「キーが長すぎてこのOSのセキュアストレージに保存できません(上限 n バイト)」というエラーになります。macOS Keychain / Linux Secret Service の上限は十分大きいため、通常は影響しません。

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### 追加
+
+- MCP サーバー `keynest-mcp`(stdio)。Claude Code などからキーを使えるようにする。キーの値は返さず、`.env` への書き出し(`inject_env`)と環境変数への注入によるコマンド実行(`run_with_keys`、出力中の値は伏せ字)で使う。ほかに `list_keys` / `list_projects` / `assign_key`
+
+### 変更
+
+- SQLite に busy_timeout(5秒)を設定。GUI と `keynest-mcp` が同時に DB を開いてもロック競合で即エラーにならないようにした
+
 ## v0.1.0 — 2026-06-12
 
 初回リリース。
