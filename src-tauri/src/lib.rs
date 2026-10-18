@@ -1,5 +1,6 @@
 mod commands;
 mod error;
+pub mod mcp;
 mod vault;
 
 use std::path::Path;

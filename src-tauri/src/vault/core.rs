@@ -1,7 +1,7 @@
 //! vault の高レベル API。Tauri コマンド層はこのモジュールだけを呼ぶ。
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -93,6 +93,12 @@ pub struct RotateResult {
 pub struct RotationInfo {
     pub rotated_at: String,
     pub old_value_masked: String,
+}
+
+/// Vault::project_env の返り値。生の値を含むため Serialize を実装せず、crate 外にも出さない。
+pub(crate) struct ProjectEnv {
+    pub(crate) dir: PathBuf,
+    pub(crate) vars: HashMap<String, String>,
 }
 
 /// キー検証の途中状態。begin_validation で作り、run でネットワーク検証を行い、
@@ -685,38 +691,21 @@ impl Vault {
         Ok(())
     }
 
-    /// プロジェクトに紐づくキー一式を、プロジェクトパス直下の .env に書き出す。
-    /// 返り値に生の値は含めない(書き出した変数名のみ)。
-    pub fn inject(&mut self, project: &str, path: Option<&str>) -> Result<InjectResult> {
-        let row: Option<(i64, Option<String>)> = self
-            .conn
+    /// プロジェクト名から (id, 保存済みパス) を返す。
+    pub(crate) fn find_project(&self, project: &str) -> Result<(i64, Option<String>)> {
+        self.conn
             .query_row(
                 "SELECT id, path FROM projects WHERE name = ?1",
                 [project],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?;
-        let Some((project_id, stored_path)) = row else {
-            return Err(Error::NotFound(format!("プロジェクト: {project}")));
-        };
-        if let Some(p) = path {
-            self.conn.execute(
-                "UPDATE projects SET path = ?1 WHERE id = ?2",
-                params![p, project_id],
-            )?;
-        }
-        let Some(target) = path.map(String::from).or(stored_path) else {
-            return Err(Error::InvalidInput(format!(
-                "プロジェクト {project} のパスが未設定です。path を指定してください"
-            )));
-        };
-        let target_dir = Path::new(&target);
-        if !target_dir.is_dir() {
-            return Err(Error::InvalidInput(format!(
-                "ディレクトリが存在しません: {target}"
-            )));
-        }
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("プロジェクト: {project}")))
+    }
 
+    /// プロジェクトに紐づくキーの「環境変数名 → 生の値」を読み出す。
+    /// 紐づけが空、またはセキュアストレージに値がないキーがあればエラー。
+    fn project_values(&self, project_id: i64, project: &str) -> Result<HashMap<String, String>> {
         let mut stmt = self.conn.prepare(
             "SELECT k.id, k.env_var_name, s.name, k.name
              FROM key_usages ku
@@ -736,12 +725,12 @@ impl Vault {
             )));
         }
 
-        let mut updates: HashMap<String, String> = HashMap::new();
+        let mut values: HashMap<String, String> = HashMap::new();
         let mut missing: Vec<String> = Vec::new();
         for (key_id, env_var_name, service, name) in keys {
             match self.store.get(key_id)? {
                 Some(value) => {
-                    updates.insert(env_var_name, value);
+                    values.insert(env_var_name, value);
                 }
                 None => missing.push(format!("{service}/{name}")),
             }
@@ -752,6 +741,68 @@ impl Vault {
                 missing.join(", ")
             )));
         }
+        Ok(values)
+    }
+
+    /// MCP の run_with_keys 用: プロジェクトの作業ディレクトリと、
+    /// 子プロセスへ注入する環境変数(生の値)を返す。
+    /// `only` を渡すとその環境変数名だけに絞る(紐づいていない名前はエラー)。
+    /// 生の値を含むため crate 外には公開しない。
+    pub(crate) fn project_env(&self, project: &str, only: Option<&[String]>) -> Result<ProjectEnv> {
+        let (project_id, stored_path) = self.find_project(project)?;
+        let Some(dir) = stored_path else {
+            return Err(Error::InvalidInput(format!(
+                "プロジェクト {project} のパスが未設定です。KeyNest でパスを設定してください"
+            )));
+        };
+        let dir = PathBuf::from(dir);
+        if !dir.is_dir() {
+            return Err(Error::InvalidInput(format!(
+                "ディレクトリが存在しません: {}",
+                dir.display()
+            )));
+        }
+        let mut vars = self.project_values(project_id, project)?;
+        if let Some(only) = only {
+            let unknown: Vec<&str> = only
+                .iter()
+                .filter(|v| !vars.contains_key(v.as_str()))
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "プロジェクト {project} に紐づいていない環境変数です: {}",
+                    unknown.join(", ")
+                )));
+            }
+            vars.retain(|k, _| only.contains(k));
+        }
+        Ok(ProjectEnv { dir, vars })
+    }
+
+    /// プロジェクトに紐づくキー一式を、プロジェクトパス直下の .env に書き出す。
+    /// 返り値に生の値は含めない(書き出した変数名のみ)。
+    pub fn inject(&mut self, project: &str, path: Option<&str>) -> Result<InjectResult> {
+        let (project_id, stored_path) = self.find_project(project)?;
+        if let Some(p) = path {
+            self.conn.execute(
+                "UPDATE projects SET path = ?1 WHERE id = ?2",
+                params![p, project_id],
+            )?;
+        }
+        let Some(target) = path.map(String::from).or(stored_path) else {
+            return Err(Error::InvalidInput(format!(
+                "プロジェクト {project} のパスが未設定です。path を指定してください"
+            )));
+        };
+        let target_dir = Path::new(&target);
+        if !target_dir.is_dir() {
+            return Err(Error::InvalidInput(format!(
+                "ディレクトリが存在しません: {target}"
+            )));
+        }
+
+        let updates = self.project_values(project_id, project)?;
 
         let env_path = target_dir.join(".env");
         envfile::merge(&env_path, &updates)?;
