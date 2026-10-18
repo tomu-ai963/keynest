@@ -353,6 +353,117 @@ mod tests {
             .contains("[REDACTED:ANTHROPIC_API_KEY]"));
     }
 
+    /// キーを登録し、dir をパスに持つプロジェクト "app" に紐づける
+    fn vault_with_project(dir: &std::path::Path) -> (Vault, TempDir) {
+        let (mut vault, db_dir) = test_vault();
+        vault
+            .set_key(
+                "anthropic",
+                "default",
+                SECRET,
+                "ANTHROPIC_API_KEY",
+                None,
+                None,
+            )
+            .unwrap();
+        vault
+            .assign_key("anthropic", None, "app", Some(dir.to_str().unwrap()))
+            .unwrap();
+        (vault, db_dir)
+    }
+
+    fn git_init(dir: &std::path::Path) {
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init に失敗");
+    }
+
+    #[test]
+    fn inject_env_refuses_git_repo_where_env_is_not_ignored() {
+        let repo = TempDir::new().unwrap();
+        git_init(repo.path());
+        let (mut vault, _db) = vault_with_project(repo.path());
+
+        let (_, resp) = roundtrip(
+            &mut vault,
+            &[call(1, "inject_env", json!({ "project": "app" }))],
+        );
+        let (text, is_error) = tool_text(&resp[0]);
+        assert!(is_error, "{text}");
+        assert!(text.contains(".gitignore"), "{text}");
+        assert!(
+            !repo.path().join(".env").exists(),
+            ".env が書き出されている"
+        );
+
+        // サブディレクトリでも、上位の .git を見つけて拒否する
+        let sub = repo.path().join("pkg");
+        std::fs::create_dir(&sub).unwrap();
+        vault
+            .assign_key("anthropic", None, "sub", Some(sub.to_str().unwrap()))
+            .unwrap();
+        let (_, resp) = roundtrip(
+            &mut vault,
+            &[call(2, "inject_env", json!({ "project": "sub" }))],
+        );
+        assert!(tool_text(&resp[0]).1, "{}", tool_text(&resp[0]).0);
+        assert!(!sub.join(".env").exists());
+
+        // .gitignore で除外されていれば書き出せる
+        std::fs::write(repo.path().join(".gitignore"), ".env\n").unwrap();
+        let (_, resp) = roundtrip(
+            &mut vault,
+            &[call(3, "inject_env", json!({ "project": "app" }))],
+        );
+        let (text, is_error) = tool_text(&resp[0]);
+        assert!(!is_error, "{text}");
+        assert!(repo.path().join(".env").exists());
+    }
+
+    #[test]
+    fn mcp_cannot_change_project_path() {
+        let project_dir = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let (mut vault, _db) = vault_with_project(project_dir.path());
+        let other_path = other.path().to_str().unwrap();
+
+        let (_, resp) = roundtrip(
+            &mut vault,
+            &[
+                call(
+                    1,
+                    "inject_env",
+                    json!({ "project": "app", "path": other_path }),
+                ),
+                call(
+                    2,
+                    "assign_key",
+                    json!({ "service": "anthropic", "project": "app",
+                                              "project_path": other_path }),
+                ),
+            ],
+        );
+        for r in &resp {
+            let (text, is_error) = tool_text(r);
+            assert!(is_error, "{text}");
+            assert!(text.contains("KeyNest アプリ"), "{text}");
+        }
+        assert!(
+            !other.path().join(".env").exists(),
+            "別ディレクトリに .env が書き出されている"
+        );
+        let stored = vault.list_projects().unwrap()[0].path.clone().unwrap();
+        assert_eq!(
+            stored,
+            project_dir.path().to_str().unwrap(),
+            "保存済みパスが書き換わっている"
+        );
+    }
+
     #[test]
     fn run_with_keys_rejects_unassigned_env_var() {
         let (mut vault, dir) = test_vault();

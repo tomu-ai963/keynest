@@ -3,6 +3,8 @@
 //! 原則: どのツールも生のキー値を返さない。キーは .env への書き出しか、
 //! 子プロセスの環境変数への注入でのみ使われる。
 
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -10,7 +12,7 @@ use serde_json::{json, Map, Value};
 
 use super::runner;
 use crate::error::{Error, Result};
-use crate::vault::core::Vault;
+use crate::vault::core::{AssignResult, InjectResult, Vault};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
@@ -44,19 +46,18 @@ pub fn definitions() -> Value {
                     "service": { "type": "string" },
                     "name": { "type": "string", "description": "Key name. Optional when the service has only one key." },
                     "project": { "type": "string" },
-                    "project_path": { "type": "string", "description": "Absolute path of the project directory" }
+                    "project_path": { "type": "string", "description": "Absolute path of the project directory. Can only be set when the project has no path yet; changing it requires the KeyNest app." }
                 },
                 "required": ["service", "project"]
             }
         },
         {
             "name": "inject_env",
-            "description": "Write all keys assigned to a project into <project dir>/.env (existing lines are kept, only the target variables are updated). Returns the variable names written, never the values. Do not read the .env file afterwards.",
+            "description": "Write all keys assigned to a project into <stored project dir>/.env (existing lines are kept, only the target variables are updated). Refused inside a git repository unless .env is git-ignored. Returns the variable names written, never the values. Do not read the .env file afterwards.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string" },
-                    "path": { "type": "string", "description": "Project directory. Omit to use the stored path." }
+                    "project": { "type": "string" }
                 },
                 "required": ["project"]
             },
@@ -108,15 +109,73 @@ pub fn call(
     match name {
         "list_keys" => to_value(vault.list_keys(opt_str(args, "service")?)?),
         "list_projects" => to_value(vault.list_projects()?),
-        "assign_key" => to_value(vault.assign_key(
-            req_str(args, "service")?,
-            opt_str(args, "name")?,
-            req_str(args, "project")?,
-            opt_str(args, "project_path")?,
-        )?),
-        "inject_env" => to_value(vault.inject(req_str(args, "project")?, opt_str(args, "path")?)?),
+        "assign_key" => to_value(assign_key(vault, args)?),
+        "inject_env" => to_value(inject_env(vault, args)?),
         "run_with_keys" => to_value(run_with_keys(vault, args)?),
         other => Err(CallError::Unknown(other.to_string())),
+    }
+}
+
+/// 保存済みのプロジェクトパスは inject_env / run_with_keys の書き込み・実行先になり、
+/// GUI からの書き出しにも使われる。MCP 経由では新規設定のみ許し、変更は GUI に限る。
+fn assign_key(vault: &mut Vault, args: &Map<String, Value>) -> Result<AssignResult> {
+    let service = req_str(args, "service")?;
+    let name = opt_str(args, "name")?;
+    let project = req_str(args, "project")?;
+    let project_path = opt_str(args, "project_path")?;
+    if let Some(new_path) = project_path {
+        match vault.find_project(project) {
+            Ok((_, Some(stored))) if stored != new_path => {
+                return Err(Error::InvalidInput(format!(
+                    "プロジェクト {project} のパスは設定済みです({stored})。\
+                     パスの変更は KeyNest アプリで行ってください"
+                )));
+            }
+            Ok(_) | Err(Error::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    vault.assign_key(service, name, project, project_path)
+}
+
+fn inject_env(vault: &mut Vault, args: &Map<String, Value>) -> Result<InjectResult> {
+    let project = req_str(args, "project")?;
+    if args.get("path").is_some_and(|v| !v.is_null()) {
+        return Err(Error::InvalidInput(
+            "MCP からは書き出し先を指定できません。プロジェクトのパスは KeyNest アプリで設定してください"
+                .into(),
+        ));
+    }
+    if let (_, Some(dir)) = vault.find_project(project)? {
+        ensure_env_not_committable(Path::new(&dir))?;
+    }
+    vault.inject(project, None)
+}
+
+/// git 管理下に .env を書き出すと、AI がそのままコミット・push してしまう事故が起きうる。
+/// 上位ディレクトリに .git があれば、.env が ignore されていることを git で確認できた場合だけ許す
+/// (git が使えない・判定に失敗した場合も拒否する)。
+fn ensure_env_not_committable(dir: &Path) -> Result<()> {
+    if !dir.ancestors().any(|d| d.join(".git").exists()) {
+        return Ok(());
+    }
+    let ignored = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["check-ignore", "-q", ".env"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ignored {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "{} は git リポジトリ内ですが、.env が .gitignore で除外されていない(または追跡済み)ため書き出しません。\
+             .gitignore に .env を追加してから再実行してください",
+            dir.display()
+        )))
     }
 }
 

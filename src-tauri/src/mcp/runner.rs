@@ -151,13 +151,15 @@ pub fn run(
     }
 
     let secrets: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let take = |cap: &Arc<Mutex<Capture>>| {
+    let take = |cap: &Arc<Mutex<Capture>>, reader: &JoinHandle<()>| {
+        // 読み取りが終わっていなければ、末尾は書き込みの途中で切れている可能性がある
+        let incomplete = !reader.is_finished();
         let c = cap.lock().unwrap_or_else(|e| e.into_inner());
-        let (text, hits) = redact(&c.buf, c.dropped, &secrets);
-        (text, hits, c.dropped)
+        let (text, hits) = redact(&c.buf, c.dropped, incomplete, &secrets);
+        (text, hits, c.dropped || incomplete)
     };
-    let (stdout, mut redacted, out_dropped) = take(&out_cap);
-    let (stderr, err_hits, err_dropped) = take(&err_cap);
+    let (stdout, mut redacted, out_dropped) = take(&out_cap, &readers[0]);
+    let (stderr, err_hits, err_dropped) = take(&err_cap, &readers[1]);
     redacted.extend(err_hits);
     redacted.sort();
     redacted.dedup();
@@ -175,23 +177,36 @@ pub fn run(
 /// 出力から secrets の値をすべて `[REDACTED:環境変数名]` に置き換える。
 /// 返り値は (置換後のテキスト, 値が見つかった環境変数名)。
 ///
+/// 値そのものに加え、ログに現れやすい表現も対象にする:
+/// UTF-16LE/BE(Windows の一部コマンドの出力)、URL エンコード、JSON の "\/" エスケープ。
+///
 /// dropped(先頭を切り捨て済み)のときは、切れ目に値の後半だけが残っている可能性があるため、
-/// 最長の値の長さぶん先頭をさらに捨ててから置換する。
-fn redact(raw: &[u8], dropped: bool, secrets: &[(&str, &str)]) -> (String, Vec<String>) {
-    let mut sorted: Vec<&(&str, &str)> = secrets.iter().filter(|(_, v)| !v.is_empty()).collect();
-    // 長い値から置換する(ある値が別の値を含む場合に、短い方で先に崩さない)
-    sorted.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+/// 最長のパターンの長さぶん先頭をさらに捨ててから置換する。
+/// incomplete(読み取り途中で打ち切った)のときは、末尾に値の前半だけが残っている可能性があるため、
+/// いずれかのパターンの前半と一致する末尾を捨てる。
+fn redact(
+    raw: &[u8],
+    dropped: bool,
+    incomplete: bool,
+    secrets: &[(&str, &str)],
+) -> (String, Vec<String>) {
+    let mut patterns: Vec<(&str, Vec<u8>)> = secrets
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .flat_map(|(name, value)| encodings(value).into_iter().map(move |p| (*name, p)))
+        .collect();
+    // 長いパターンから置換する(ある値が別の値を含む場合に、短い方で先に崩さない)
+    patterns.sort_by_key(|(_, p)| std::cmp::Reverse(p.len()));
+    let longest = patterns.first().map_or(0, |(_, p)| p.len());
 
     let mut data: Vec<u8> = if dropped {
-        let skip = sorted.first().map_or(0, |(_, v)| v.len()).min(raw.len());
-        raw[skip..].to_vec()
+        raw[longest.min(raw.len())..].to_vec()
     } else {
         raw.to_vec()
     };
 
     let mut hits = Vec::new();
-    for (name, value) in sorted {
-        let needle = value.as_bytes();
+    for (name, needle) in &patterns {
         let marker = format!("[REDACTED:{name}]");
         let mut out = Vec::with_capacity(data.len());
         let mut i = 0;
@@ -206,12 +221,43 @@ fn redact(raw: &[u8], dropped: bool, secrets: &[(&str, &str)]) -> (String, Vec<S
                 i += 1;
             }
         }
-        if found {
+        if found && !hits.iter().any(|h| h == name) {
             hits.push(name.to_string());
         }
         data = out;
     }
+
+    if incomplete {
+        let partial = patterns
+            .iter()
+            .flat_map(|(_, p)| (1..p.len()).filter(|&k| data.ends_with(&p[..k])))
+            .max()
+            .unwrap_or(0);
+        data.truncate(data.len() - partial);
+    }
     (String::from_utf8_lossy(&data).into_owned(), hits)
+}
+
+/// 値がログに現れうる表現の一覧(重複は除く)。
+fn encodings(value: &str) -> Vec<Vec<u8>> {
+    let mut out = vec![
+        value.as_bytes().to_vec(),
+        value.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        value.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        value.replace('/', "\\/").into_bytes(),
+    ];
+    let mut url = String::new();
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out.push(url.into_bytes());
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -222,6 +268,7 @@ mod tests {
     fn redact_replaces_all_occurrences() {
         let (text, hits) = redact(
             b"key=sk-secret-123 again sk-secret-123",
+            false,
             false,
             &[("API_KEY", "sk-secret-123")],
         );
@@ -234,6 +281,7 @@ mod tests {
         let (text, mut hits) = redact(
             b"abcdef-long and abcdef",
             false,
+            false,
             &[("SHORT", "abcdef"), ("LONG", "abcdef-long")],
         );
         hits.sort();
@@ -244,15 +292,56 @@ mod tests {
     #[test]
     fn redact_drops_possible_partial_secret_after_truncation() {
         // 先頭が切り捨てられ、値の後半 "cret-123" だけが残っているケース
-        let (text, hits) = redact(b"cret-123 tail output", true, &[("K", "sk-secret-123")]);
+        // (捨てる幅は最長パターン = UTF-16 表現の 26 バイトなので、それより長い入力にする)
+        let (text, hits) = redact(
+            b"cret-123 ................................ tail output",
+            true,
+            false,
+            &[("K", "sk-secret-123")],
+        );
         assert!(!text.contains("cret-123"), "{text}");
         assert!(text.ends_with("output"));
         assert!(hits.is_empty());
     }
 
     #[test]
+    fn redact_trims_partial_secret_at_end_when_incomplete() {
+        // 読み取り途中で打ち切り、値の前半 "sk-secr" だけが末尾に残っているケース
+        let (text, _) = redact(b"log line sk-secr", false, true, &[("K", "sk-secret-123")]);
+        assert!(!text.contains("sk-secr"), "{text}");
+        assert!(text.starts_with("log line"), "{text}");
+    }
+
+    #[test]
+    fn redact_handles_utf16_output() {
+        // Windows の一部コマンドは UTF-16LE で出力する
+        let raw: Vec<u8> = "value=sk-secret-123 tail"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let (text, hits) = redact(&raw, false, false, &[("K", "sk-secret-123")]);
+        let visible: String = text.chars().filter(|c| *c != '\0').collect();
+        assert!(!visible.contains("sk-secret-123"), "{visible:?}");
+        assert!(!visible.contains("secret"), "{visible:?}");
+        assert_eq!(hits, vec!["K"]);
+    }
+
+    #[test]
+    fn redact_handles_url_and_json_escaped_forms() {
+        let secret = "abc+def/ghi=jkl";
+        let (text, hits) = redact(
+            br#"GET /v1?key=abc%2Bdef%2Fghi%3Djkl {"k":"abc+def\/ghi=jkl"}"#,
+            false,
+            false,
+            &[("K", secret)],
+        );
+        assert!(!text.contains("def"), "{text}");
+        assert_eq!(hits, vec!["K"]);
+    }
+
+    #[test]
     fn redact_without_secrets_is_identity() {
-        let (text, hits) = redact(b"hello", false, &[]);
+        let (text, hits) = redact(b"hello", false, false, &[]);
         assert_eq!(text, "hello");
         assert!(hits.is_empty());
     }

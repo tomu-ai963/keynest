@@ -691,7 +691,8 @@ impl Vault {
         Ok(())
     }
 
-    fn find_project(&self, project: &str) -> Result<(i64, Option<String>)> {
+    /// プロジェクト名から (id, 保存済みパス) を返す。
+    pub(crate) fn find_project(&self, project: &str) -> Result<(i64, Option<String>)> {
         self.conn
             .query_row(
                 "SELECT id, path FROM projects WHERE name = ?1",
